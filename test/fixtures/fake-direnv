@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Fake direnv binary for tests.
+#
+# Dispatches on $1 (the direnv subcommand):
+#   export json  → emit FAKE_DIRENV_EXPORT (literal JSON, or @PATH to read a file)
+#   status --json → emit FAKE_DIRENV_STATUS (literal JSON, or @PATH to read a file)
+#   anything else → error
+#
+# Common env vars:
+#   FAKE_DIRENV_EXIT     - exit code for the matched subcommand (default 0)
+#   FAKE_DIRENV_STDERR   - stderr content (literal or @PATH), printed before exit
+#   FAKE_DIRENV_LOGFILE  - if set, append "argv0|argv1|argv2|...|CWD=$PWD\n" per invocation
+#                          (for asserting spawn counts and ordering in tests)
+
+set -u
+
+# Log the invocation if requested.
+if [ -n "${FAKE_DIRENV_LOGFILE:-}" ]; then
+  printf '%s' "$0" >> "$FAKE_DIRENV_LOGFILE"
+  for arg in "$@"; do
+    printf '|%s' "$arg" >> "$FAKE_DIRENV_LOGFILE"
+  done
+  printf '|CWD=%s\n' "$PWD" >> "$FAKE_DIRENV_LOGFILE"
+fi
+
+# Emit stderr if requested.
+emit() {
+  # $1 = env var name (e.g. FAKE_DIRENV_EXPORT), $2 = file descriptor (1 = stdout, 2 = stderr)
+  local val="${!1:-}"
+  if [ -z "$val" ]; then
+    return 0
+  fi
+  if [[ "$val" == @* ]]; then
+    cat "${val#@}" >&"$2"
+  else
+    printf '%s' "$val" >&"$2"
+  fi
+}
+
+emit FAKE_DIRENV_STDERR 2
+
+# Dispatch on subcommand.
+case "${1:-}" in
+  export)
+    if [ "${2:-}" = "json" ]; then
+      emit FAKE_DIRENV_EXPORT 1
+    fi
+    ;;
+  status)
+    if [ "${2:-}" = "--json" ]; then
+      emit FAKE_DIRENV_STATUS 1
+    fi
+    ;;
+esac
+
+exit "${FAKE_DIRENV_EXIT:-0}"
