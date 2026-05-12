@@ -32,13 +32,57 @@ every shell invocation OpenCode performs.
 
 - Inject direnv-managed variables into `output.env` on every `shell.env` hook
   call, scoped to the invocation's `cwd`.
-- Respect `.envrc` allow/block status — never bypass direnv's security model.
+- Respect `.envrc` allow/block status — never bypass direnv's security model,
+  and actively instruct the agent not to bypass it either.
 - Be fast enough that the latency overhead is invisible in interactive use
   (cached path < 5ms).
 - Fail gracefully and visibly when direnv is missing, blocked, or broken —
   never crash a shell call.
 - Give the agent first-class tools to reload and inspect direnv state for
   debugging.
+
+## Security posture: `direnv allow`
+
+`direnv allow` authorizes a `.envrc` to execute arbitrary shell code in the
+user's environment. It is the security boundary direnv was built around: an
+unfamiliar `.envrc` (from a freshly cloned repo, an unpacked tarball, etc.)
+is blocked by default precisely so a human can read it before granting it
+execute-on-cd privileges.
+
+An AI agent that helpfully runs `direnv allow` to clear a blocked-envrc
+warning bypasses that boundary on the user's behalf. The threat is concrete:
+a malicious `.envrc` in a repo can exfiltrate keys, modify dotfiles, or
+worse, all under the guise of "setting up the environment."
+
+**The agent must not run `direnv allow` on its own.** This rule is enforced
+softly — by wording, not by interception — in three places:
+
+1. **Blocked-envrc warning message** emitted via `log.warnOnce` and returned
+   from `direnv_reload` / `direnv_status` tool failures:
+
+   > `.envrc at <root> is not allowed. Show its contents to the user and ask
+   > them to run `direnv allow` after they've reviewed it. Do not run
+   > `direnv allow` yourself — it grants the `.envrc` permission to execute
+   > arbitrary shell code in the user's environment.
+
+2. **Tool descriptions** for `direnv_reload` and `direnv_status` include a
+   trailing safety note:
+
+   > **Safety:** If this reports that an `.envrc` is not allowed, do not run
+   > `direnv allow` to fix it. That command authorizes arbitrary shell
+   > execution; the user must review the `.envrc` and run `direnv allow`
+   > themselves.
+
+3. **README** includes a "Safety: `direnv allow`" section documenting the
+   posture so users understand what the plugin tells the agent and can adjust
+   their own workflow accordingly.
+
+We deliberately do **not** add a `tool.execute.before` hook to intercept
+`direnv allow` invocations. Such a hook would be bypassable (different
+quoting, writing the allow-file directly, invoking via `sh -c`, etc.), so it
+would amount to security theater while expanding our plugin's surface area
+into other tools. Instructions, applied at the points the agent reads, are
+the honest mechanism.
 
 ## Non-goals
 
@@ -358,9 +402,14 @@ it when no root applies.
 direnv_reload: tool({
   description:
     "Reload the direnv environment for the current working directory. " +
-    "Use this after editing an .envrc, running `direnv allow`, or when " +
+    "Use this after the user has edited and allowed an .envrc, or when " +
     "environment variables seem stale. Returns a summary of what changed. " +
-    "Variable values are never included in the output — only names and counts.",
+    "Variable values are never included in the output — only names and counts. " +
+    "\n\n" +
+    "Safety: If this reports that an .envrc is not allowed, do NOT run " +
+    "`direnv allow` to fix it. That command authorizes arbitrary shell " +
+    "execution; show the .envrc contents to the user and ask them to run " +
+    "`direnv allow` themselves after reviewing.",
   args: {
     cwd: tool.schema.string().optional()
       .describe("Directory to resolve direnv against. Defaults to the project worktree."),
@@ -396,7 +445,12 @@ direnv_status: tool({
     "Show what direnv is currently contributing to the shell environment. " +
     "Lists the resolved .envrc root, which variables direnv is setting or " +
     "unsetting, and any allow/deny filter that's active. Useful for debugging " +
-    "why an env var isn't showing up.",
+    "why an env var isn't showing up." +
+    "\n\n" +
+    "Safety: If this reports that an .envrc is not allowed, do NOT run " +
+    "`direnv allow` to fix it. That command authorizes arbitrary shell " +
+    "execution; show the .envrc contents to the user and ask them to run " +
+    "`direnv allow` themselves after reviewing.",
   args: {
     cwd: tool.schema.string().optional(),
     show_values: tool.schema.boolean().optional().default(false)
@@ -463,7 +517,7 @@ case-sensitive (matching shell convention).
 |---|---|
 | `direnv` binary not found at init | `log.warn` once, plugin returns `{}` (no hooks, no tools) |
 | `direnv` binary missing at hook time (deleted post-init) | `warnOnce("missing-bin")`, cache empty env |
-| `.envrc` exists but not allowed | `warnOnce("blocked:<root>", "Run `direnv allow` in <root>")`, cache empty env |
+| `.envrc` exists but not allowed | `warnOnce("blocked:<root>", <safety-aware message>)`, cache empty env. Message text per the "Security posture" section — explicitly tells the agent not to run `direnv allow` itself. |
 | `direnv export json` exits non-zero (other) | `log.error` with stderr, cache empty env |
 | JSON parse fails | `log.error`, cache empty env |
 | Hook handler itself throws | Top-level `try/catch` logs and swallows |
@@ -546,7 +600,10 @@ Coverage targets:
 - **`tools.test.ts`**:
   - `direnv_reload` returns "no .envrc" message when appropriate.
   - `direnv_reload` produces correct added/changed/removed/unchanged diff.
-  - `direnv_reload` surfaces blocked hint with `direnv allow` instruction.
+  - `direnv_reload` blocked-envrc return string contains the safety-aware
+    wording: includes "do not run `direnv allow` yourself" verbatim. This is
+    a regression-protection test for the security posture — the exact
+    wording is part of the plugin's contract with the agent.
   - `direnv_reload` invalidates cache: subsequent `shell.env` call re-spawns
     (asserted via `FAKE_DIRENV_LOGFILE`).
   - `direnv_status` reads from cache without invalidating; spawn count
@@ -617,9 +674,12 @@ Users add it to `opencode.json`:
 4. **Configuration** — table of env vars.
 5. **Tools** — `direnv_reload`, `direnv_status` with example agent output.
 6. **Precedence** — direnv wins; deny list is the escape hatch.
-7. **Troubleshooting** — "direnv blocked", missing binary, why values aren't
+7. **Safety: `direnv allow`** — the plugin actively instructs the agent not
+   to run `direnv allow` on its own; this section documents that posture so
+   users know what to expect.
+8. **Troubleshooting** — "direnv blocked", missing binary, why values aren't
    appearing.
-8. **License** — MIT.
+9. **License** — MIT.
 
 ## Risks
 
