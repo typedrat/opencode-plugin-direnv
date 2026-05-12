@@ -7,9 +7,10 @@
 
 An OpenCode plugin that gives the agent (and the user's terminals launched
 through OpenCode) the same environment `direnv` would produce for the current
-working directory. Variables are injected via the `shell.env` hook, cached by
-direnv-root with mtime-based invalidation, and made inspectable and refreshable
-via two custom tools: `direnv_reload` and `direnv_status`.
+working directory. Variables are injected via the `shell.env` hook, cached
+per direnv-root with invalidation driven by direnv's own watch-list (via
+`direnv status --json`), and made inspectable and refreshable via two custom
+tools: `direnv_reload` and `direnv_status`.
 
 Distributed as the npm package `opencode-plugin-direnv` and authored as a
 TypeScript Bun module with zero runtime dependencies.
@@ -57,11 +58,43 @@ given `cwd` emits a JSON object mapping variable names to either string values
 cache the result. The same contract is what `direnv`'s editor integrations and
 tools like `mise` use, so it's well-trodden ground.
 
+### How direnv decides to reload (and how we mirror it)
+
+In an interactive shell, direnv's shell hook calls `direnv export <shell>`
+before every prompt. The binary itself decides whether the environment needs
+reloading based on a **watch-list** of files. The watch-list always includes
+the active `.envrc` and is extended by stdlib directives the `.envrc` invokes:
+
+- `watch_file <path>` and `watch_dir <dir>` — explicit additions.
+- `source_up`, `source_env`, `source_env_if_exists`, `dotenv`,
+  `dotenv_if_exists` — referenced files are added automatically.
+- `on_git_branch` — adds `.git/HEAD` to the watch-list.
+- `use flake`, `use nix`, `layout python`, `layout node`, etc. — add their
+  relevant manifest/lock files.
+- `require_allowed` (direnv ≥ 2.38.0) — adds files that must be re-allowed
+  on change.
+
+direnv reloads when any file in the watch-list has a different mtime/hash
+than the last load, and unloads when the cwd is no longer inside the loaded
+root. We must mirror both behaviors to be correct.
+
+The full watch-list and its recorded mtimes are exposed via
+`direnv status --json`, under `state.foundRC.watches`. We use this as the
+authoritative source for cache invalidation. Tracking only `.envrc` mtime is
+insufficient — `.envrc`s with `watch_file Gemfile` or `on_git_branch` would
+serve stale env when those files change.
+
 Alternatives considered and rejected:
 
+- **No cache, always call `direnv export json`** — simpler, always correct,
+  but pays direnv's startup cost (~5-30ms typically) on every shell call.
+  Multiple `shell.env` invocations within a single agent turn would each
+  re-spawn direnv.
+- **mtime on `.envrc` only** — what most naive implementations do, breaks
+  for `watch_file`, `on_git_branch`, language layouts.
 - **`direnv exec <dir> env -0` + diff against `process.env`** — works without
-  the JSON contract but is brittle (`SHLVL`, `_`, and other noise leak through)
-  and slower (extra `env` process).
+  the JSON contract but is brittle (`SHLVL`, `_`, and other noise leak
+  through) and slower (extra `env` process).
 - **Reimplementing `.envrc` parsing in JS** — `.envrc` files routinely
   `source_up`, `use flake`, `use nix`, `dotenv`, etc. Reimplementing direnv's
   stdlib is a nightmare and would diverge from upstream.
@@ -102,26 +135,35 @@ cwd = input.cwd ?? project.worktree ?? project.directory
   ▼
 findDirenvRoot(cwd)              ── walk up looking for .envrc, stop at fs root
   │
-  ├── none → return (no-op)
+  ├── none → unloadIfNeeded(cwd, output.env)
+  │           └── if some root was previously loaded for this hook chain
+  │               and cwd is now outside it: apply that root's last
+  │               result as unsets (mirror direnv's "cd-out unload")
   │
   ▼
-cache.get(root)                  ── re-stats tracked files for mtime
+cache.get(root)                  ── re-stats every file in entry.watches
   │
-  ├── hit, mtimes unchanged → use cached env
+  ├── hit, all watch-list mtimes unchanged → use cached env + watches
   │
   └── miss or stale
         │
         ▼
-      direnv.exportJson(bin, root)   ── Bun.spawn([bin, "export", "json"], { cwd: root })
-        │
+      direnv.exportJson(bin, root)        ── Bun.spawn([bin, "export", "json"], { cwd: root })
+      direnv.statusJson(bin, root)        ── Bun.spawn([bin, "status", "--json"], { cwd: root })
+        │                                    (parallel, both required for a fresh cache entry)
         ├── exit ≠ 0 / missing bin / blocked .envrc
-        │     → log.warnOnce, cache empty env (so we don't respawn endlessly)
+        │     → log.warnOnce, cache empty env + empty watch-list
         │
         ▼
-      parse JSON → Record<string, string | null>
+      parse export JSON → Record<string, string | null>
+      parse status JSON → watches: { path, mtime }[]
+        │
+        │   If status --json fails or schema doesn't match, fall back to
+        │   watches = [{ path: root + "/.envrc", mtime: stat(...).mtimeMs }]
+        │   and log.warnOnce("status-fallback").
         │
         ▼
-      cache.set(root, { env, mtimes })
+      cache.set(root, { env, watches, computedAt })
   │
   ▼
 applyEnv(output.env, resolvedEnv, allow, deny)
@@ -129,10 +171,22 @@ applyEnv(output.env, resolvedEnv, allow, deny)
   ├── null value → delete output.env[key]
   ├── string value → set output.env[key] (overrides existing — direnv wins)
   └── verbose → log injected/removed key names (never values)
+  │
+  ▼
+track(root) as "most recently loaded" for this plugin instance
+  (used by unloadIfNeeded on a future call that exits the root)
 ```
 
 Top-level handler is wrapped in `try/catch` that logs and swallows — a
 plugin bug must never break shell execution.
+
+**cwd-out unload.** The plugin instance keeps a `lastLoadedRoot: string | null`.
+When `findDirenvRoot(cwd)` returns either `null` or a different root than
+`lastLoadedRoot`, and `lastLoadedRoot` is non-null, we apply the previous
+root's cached env as **unsets** to `output.env` before processing the new root
+(if any). This mirrors `direnv: unloading` in a real shell. If the previous
+root's cache entry has been evicted/invalidated, we fall back to a no-op
+(can't unset what we never recorded).
 
 ### Module contracts
 
@@ -164,12 +218,22 @@ logs once, and the plugin becomes a no-op for the session.
 **`direnv.ts`** — pure I/O wrapper, no caching.
 
 ```ts
-export type DirenvResult =
-  | { ok: true; env: Record<string, string | null>; sourcedFiles: string[] }
+export interface WatchEntry {
+  path: string;       // absolute
+  mtime: number;      // ms since epoch, from direnv (or our stat fallback)
+}
+
+export type ExportResult =
+  | { ok: true; env: Record<string, string | null> }
   | { ok: false; kind: "missing-bin" | "blocked" | "exec-error" | "parse-error"; message: string };
 
+export type StatusResult =
+  | { ok: true; watches: WatchEntry[] }
+  | { ok: false; kind: "missing-bin" | "exec-error" | "parse-error" | "schema-mismatch"; message: string };
+
 export async function findDirenvRoot(cwd: string): Promise<string | null>;
-export async function exportJson(bin: string, cwd: string): Promise<DirenvResult>;
+export async function exportJson(bin: string, cwd: string): Promise<ExportResult>;
+export async function statusJson(bin: string, cwd: string): Promise<StatusResult>;
 ```
 
 `findDirenvRoot` walks up from `cwd` checking for `.envrc` at each level,
@@ -181,19 +245,23 @@ stderr: "pipe" })`. On non-zero exit, classifies the error by stderr pattern
 (direnv's blocked-envrc message is recognizable and stable; everything else is
 `exec-error`). On exit 0, parses stdout as JSON; failure is `parse-error`.
 
-`sourcedFiles`: best-effort. On the same call we also invoke `direnv status
---json` and extract the list of files in the load chain. If that command fails
-or its schema differs from what we expect, fall back to `[root + "/.envrc"]`.
-Cache invalidation degrades gracefully — worst case the user edits a
-`source_up`'d file and must call `direnv_reload` to see the change.
+`statusJson` runs `direnv status --json` the same way. It parses
+`state.foundRC.watches` (an array of `{Path, Modified}` objects) and returns
+the canonicalized `WatchEntry[]`. If `state.foundRC` is absent, returns
+`ok: true` with an empty `watches` array (means: no `.envrc` is active here,
+nothing to watch). If the schema doesn't match what we expect — different
+key casing, missing fields, etc. — returns `schema-mismatch`. Callers
+(plugin and tools) treat `schema-mismatch` as a soft failure: log it via
+`warnOnce("status-fallback")` once per session, then fall back to watching
+only the root `.envrc` by stat.
 
 **`cache.ts`** — in-memory only, scoped to the plugin instance.
 
 ```ts
 export interface CacheEntry {
   env: Record<string, string | null>;
-  mtimes: Map<string, number>;  // absolute file path → mtime ms
-  computedAt: number;           // for status output
+  watches: WatchEntry[];        // from direnv status --json (or fallback)
+  computedAt: number;           // ms since epoch, for status output
 }
 
 export class DirenvCache {
@@ -205,9 +273,10 @@ export class DirenvCache {
 }
 ```
 
-`get` re-stats every file in `entry.mtimes` via `Bun.file(path).stat()`; if any
-mtime differs or any tracked file is now missing, returns `null`. No TTL, no
-LRU — direnv roots per session are bounded.
+`get` re-stats every file in `entry.watches` via `Bun.file(path).stat()`;
+if any file's current mtime differs from the recorded `WatchEntry.mtime`, or
+any tracked file no longer exists, returns `null` (stale). No TTL, no LRU —
+direnv roots per session are bounded.
 
 `peek` exists so `direnv_status` can show the last-computed state without
 paying for re-stats, and so `direnv_reload` can diff old-vs-new.
@@ -261,7 +330,11 @@ export const DirenvPlugin: Plugin = async (ctx) => {
 
   const cache = new DirenvCache();
   const defaultCwd = ctx.worktree ?? ctx.directory;
-  const deps = { cache, config, log, defaultCwd };
+
+  // Mutable per-instance state for cwd-out unload.
+  const state = { lastLoadedRoot: null as string | null };
+
+  const deps = { cache, config, log, defaultCwd, state };
 
   return {
     "shell.env": makeShellEnvHandler(deps),
@@ -272,6 +345,10 @@ export const DirenvPlugin: Plugin = async (ctx) => {
   };
 };
 ```
+
+`state.lastLoadedRoot` is updated by the `shell.env` handler after a
+successful apply. The unload-on-cwd-out logic reads it on entry and clears
+it when no root applies.
 
 ### Custom tools
 
@@ -342,12 +419,17 @@ Behavior:
    ```
    direnv status
    root:       /path/to/root
-   .envrc:     allowed (mtime: 2026-05-11 14:22:01)
-   sourced:    .envrc, ../shared.envrc
    binary:     /usr/bin/direnv
    verbose:    off
    allow list: <none>
    deny list:  SECRET_TOKEN
+   cached at:  2026-05-11 14:22:01
+
+   watching (4):
+     /path/to/root/.envrc
+     /path/to/root/Gemfile
+     /path/to/root/.git/HEAD
+     /path/to/shared/.envrc        (from source_up)
 
    setting (8):
      DATABASE_URL
@@ -406,11 +488,14 @@ where another plugin or the user needs to win.
 
 ```bash
 #!/usr/bin/env bash
+# Dispatches on $1 (the direnv subcommand):
+#   export        → emit FAKE_DIRENV_EXPORT (literal JSON or @file)
+#   status        → emit FAKE_DIRENV_STATUS (literal JSON or @file)
 # Reads:
-#   FAKE_DIRENV_EXIT     - exit code (default 0)
-#   FAKE_DIRENV_STDOUT   - path to a file to cat as stdout, OR literal JSON
-#   FAKE_DIRENV_STDERR   - path to a file to cat as stderr, OR literal string
-# Echoes / exits accordingly.
+#   FAKE_DIRENV_EXIT      - exit code for the matched subcommand (default 0)
+#   FAKE_DIRENV_STDERR    - stderr content (literal or @file), for error tests
+#   FAKE_DIRENV_LOGFILE   - if set, append each invocation's argv + cwd here
+#                           (used to assert spawn counts and ordering)
 ```
 
 Tests set `OPENCODE_DIRENV_BIN` to the fake's absolute path and the
@@ -421,34 +506,56 @@ Coverage targets:
 
 - **`config.ts`**: each env var parsed, `ConfigError` when bin can't be resolved,
   empty-string vs unset semantics, case-insensitive boolean parsing.
-- **`direnv.ts`**: `findDirenvRoot` finds nearest `.envrc`, stops at fs root;
-  `exportJson` happy path, blocked detection from stderr, exec-error, parse-error;
-  `sourcedFiles` populated from `direnv status --json` when available.
-- **`cache.ts`**: `get` returns null on miss, null on stale (touch a fixture
-  file), entry on fresh; `peek` ignores staleness; `invalidate` works;
-  multiple roots coexist.
-- **`plugin.test.ts`**: end-to-end with a fake `ctx` (stub `client.app.log`,
-  real `project`/`directory`/`worktree`), construct via `DirenvPlugin(ctx)`,
-  call the returned `shell.env` handler with various `input`/`output` shapes,
-  assert `output.env`. Tests:
+- **`direnv.ts`**:
+  - `findDirenvRoot` finds nearest `.envrc`, stops at fs root, returns null
+    when none exists.
+  - `exportJson` happy path, blocked detection from stderr, `exec-error`,
+    `parse-error`.
+  - `statusJson` happy path produces `WatchEntry[]` from `state.foundRC.watches`,
+    `schema-mismatch` when the JSON doesn't have the expected shape, empty
+    watches when `state.foundRC` is absent.
+- **`cache.ts`**:
+  - `get` returns null on miss.
+  - `get` returns null on stale: touch a file listed in `watches` so its mtime
+    changes, assert stale.
+  - `get` returns null when a watched file is deleted.
+  - `get` returns the entry when all watched files are unchanged.
+  - `peek` ignores staleness.
+  - `invalidate` works; multiple roots coexist independently.
+- **`plugin.test.ts`** — end-to-end with a fake `ctx`:
   - direnv-wins precedence over pre-existing `output.env` values
   - null values delete keys
   - allow list filtering
   - deny list filtering (overrides allow)
   - verbose mode logs names only
-  - `warnOnce` deduplicates blocked-envrc warnings across calls
+  - `warnOnce` deduplicates blocked-envrc warnings across repeated calls to
+    the same root
   - hook never throws even when `exportJson` errors
+  - watch-list invalidation: first call spawns direnv, second call (with
+    unchanged watch-list mtimes) does not spawn, third call (after touching
+    a watched file) spawns again. Asserted via `FAKE_DIRENV_LOGFILE`.
+  - `statusJson` schema-mismatch falls back to root-`.envrc`-only watch and
+    logs `warnOnce("status-fallback")` once.
+  - **cwd-out unload**: call with cwd inside root A (sets `FOO=1`), then call
+    with cwd outside any root — assert `output.env.FOO` is `undefined`
+    (deleted), and `lastLoadedRoot` is now `null`.
+  - **cwd-cross-root unload**: call with cwd inside root A (sets `FOO=1`),
+    then with cwd inside root B (sets `BAR=2`) — assert `FOO` is unset and
+    `BAR` is set in `output.env`.
+  - cwd-out unload no-ops when the previous root's cache entry was evicted.
 - **`tools.test.ts`**:
-  - `direnv_reload` returns "no .envrc" message when appropriate
-  - `direnv_reload` produces correct added/changed/removed/unchanged diff
-  - `direnv_reload` surfaces blocked hint with `direnv allow` instruction
-  - `direnv_reload` invalidates cache (subsequent `shell.env` call re-spawns —
-    assert via fake-direnv invocation counter file)
-  - `direnv_status` reads from cache without invalidating
-  - `direnv_status` populates cache on miss
-  - `direnv_status` shows only names by default
-  - `direnv_status` shows values when `show_values: true`
-  - `direnv_status` reports deny-filtered variables in their own section
+  - `direnv_reload` returns "no .envrc" message when appropriate.
+  - `direnv_reload` produces correct added/changed/removed/unchanged diff.
+  - `direnv_reload` surfaces blocked hint with `direnv allow` instruction.
+  - `direnv_reload` invalidates cache: subsequent `shell.env` call re-spawns
+    (asserted via `FAKE_DIRENV_LOGFILE`).
+  - `direnv_status` reads from cache without invalidating; spawn count
+    unchanged after the call.
+  - `direnv_status` populates cache on miss.
+  - `direnv_status` shows only names by default.
+  - `direnv_status` shows values when `show_values: true`.
+  - `direnv_status` reports deny-filtered variables in their own section.
+  - `direnv_status` lists the resolved watch-list files.
 
 ## Packaging
 
@@ -519,12 +626,24 @@ Users add it to `opencode.json`:
 - **`direnv export json` schema changes.** Stable for years, but if upstream
   changes the contract our parser breaks. Mitigation: `parse-error` is a
   classified error kind with a clear log message pointing at upstream.
-- **`direnv status --json` schema.** Less stable than `export json`. We
-  treat it as best-effort and fall back to root `.envrc`-only mtime tracking
-  if the schema doesn't match expectations.
+- **`direnv status --json` schema changes.** Less stable than `export json`
+  — it's labeled as debug output upstream. Mitigation: we detect schema
+  mismatch and fall back to root-`.envrc`-only mtime tracking, log the
+  fallback once per session, and let users still get correct behavior for
+  the common case (no `watch_file`, no `on_git_branch`).
 - **Latency on cache miss.** First `shell.env` call in a new direnv root pays
-  the cost of `direnv export json` (typically 10–200ms). Acceptable; subsequent
-  calls are sub-millisecond.
+  the cost of `direnv export json` + `direnv status --json` (run in parallel,
+  total typically 10–200ms). Acceptable; subsequent calls are sub-millisecond
+  (just stat calls).
+- **Stat cost on the hot path.** Each cached `shell.env` call stats every
+  file in the watch-list. Typical watch-lists are 1–5 files; even pathological
+  `watch_dir` cases stay small. If this ever becomes hot, we can add a
+  short-window TTL to coalesce bursts.
+- **cwd-out unload incompleteness.** If a previous root's cache entry was
+  evicted (e.g. process restart between calls), we can't emit the
+  corresponding unsets. Result: a few stale variables linger until the next
+  shell sets/overrides them. Same failure mode as restarting an interactive
+  shell mid-session; acceptable.
 - **Secret exposure via `direnv_status --show_values`.** The agent has to opt
   in per-call, and the tool description explicitly warns about it. This is the
   right friction level for an interactive debugging tool.
