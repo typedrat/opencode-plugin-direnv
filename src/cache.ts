@@ -55,7 +55,11 @@ export class DirenvCache {
       } catch {
         return false; // file missing → stale
       }
-      if (currentMtime !== watch.mtime) {
+      // Compare at integer-millisecond precision. The stored mtime may have been
+      // parsed from an ISO 8601 string (e.g. from direnv status --json), which
+      // only carries millisecond precision. The kernel mtime can have fractional
+      // milliseconds; truncating both sides avoids spurious cache misses.
+      if (Math.trunc(currentMtime) !== Math.trunc(watch.mtime)) {
         return false;
       }
     }
