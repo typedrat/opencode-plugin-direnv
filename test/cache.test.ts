@@ -103,10 +103,15 @@ describe("DirenvCache", () => {
     cleanup();
   });
 
-  test("entry with empty watches is always fresh (degenerate case)", async () => {
+  test("entry with empty watches is always stale (degenerate case)", async () => {
+    // Empty watches only happens when .envrc vanishes between findDirenvRoot
+    // and the status-fallback stat. We prefer re-spawning direnv each call
+    // (which will re-error cleanly) over serving a permanently-cached empty env.
     const cache = new DirenvCache();
     cache.set("/x", { env: { FOO: "bar" }, watches: [], computedAt: 0 });
     const hit = await cache.get("/x");
-    expect(hit).not.toBeNull();
+    expect(hit).toBeNull();
+    // peek still returns the entry — staleness is a `get` concept.
+    expect(cache.peek("/x")).not.toBeNull();
   });
 });

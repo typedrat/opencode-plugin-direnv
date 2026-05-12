@@ -9,7 +9,10 @@ import type { CacheEntry } from "./types.ts";
  * Staleness: `get` re-stats every file in `entry.watches` and returns null
  * if any file's current mtime differs from the recorded one, or if a watched
  * file no longer exists. An entry with an empty watch-list is treated as
- * always-fresh (degenerate but valid: nothing to watch means nothing can change).
+ * always-stale — the only way to produce one in practice is `.envrc` having
+ * vanished between findDirenvRoot and the status-fallback stat, and in that
+ * degenerate state we'd rather re-spawn direnv on every call (which will
+ * re-error cleanly) than serve a permanently-cached empty env.
  */
 export class DirenvCache {
   readonly #entries = new Map<string, CacheEntry>();
@@ -48,6 +51,8 @@ export class DirenvCache {
   }
 
   #isFresh(entry: CacheEntry): boolean {
+    // Empty watch-list → always stale. See class doc for rationale.
+    if (entry.watches.length === 0) return false;
     for (const watch of entry.watches) {
       let currentMtime: number;
       try {
